@@ -42,6 +42,8 @@ search uses BM25 ranking on title and description. you can also filter by catego
 - `GET /` - the search ui
 - `GET /api/search?q=headphones&category=electronics` - search api
 - `GET /api/stats` - product count, categories, brands
+- `GET /api/vespa-metrics` - vespa health, memory, cpu, query latency
+- `GET /metrics` - prometheus-compatible metrics
 
 vespa's own api is at http://localhost:8080 if you want to poke around directly.
 
@@ -60,6 +62,10 @@ app/
   static/style.css
 data/products.json      # sample data (50 products)
 ```
+
+## architecture and production notes
+
+see [ARCHITECTURE.md](ARCHITECTURE.md) for how this works under the hood and what you'd need to change to make it production-ready (multi-node clusters, k8s, search improvements, monitoring, etc).
 
 ## shutting down
 
