@@ -41,9 +41,25 @@ search uses BM25 ranking on title and description. you can also filter by catego
 
 - `GET /` - the search ui
 - `GET /api/search?q=headphones&category=electronics` - search api
-- `POST /api/feed` - re-feed all products from data/products.json
+- `GET /api/stats` - product count, categories, brands
 
 vespa's own api is at http://localhost:8080 if you want to poke around directly.
+
+## project structure
+
+```
+docker-compose.yml      # vespa container
+vespa-app/              # vespa application package
+  schemas/product.sd    # product schema (fields, ranking)
+  services.xml          # vespa service config
+  hosts.xml
+app/
+  main.py               # fastapi backend
+  feed.py               # data feeder script
+  templates/index.html  # search page
+  static/style.css
+data/products.json      # sample data (50 products)
+```
 
 ## shutting down
 

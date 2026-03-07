@@ -91,6 +91,9 @@
         ['filter-category', 'filter-brand', 'filter-sort'].forEach(id => {
             document.getElementById(id).addEventListener('change', doSearch);
         });
+        ['filter-min-price', 'filter-max-price'].forEach(id => {
+            document.getElementById(id).addEventListener('change', doSearch);
+        });
         document.getElementById('filter-in-stock').addEventListener('change', doSearch);
 
         async function doSearch() {
