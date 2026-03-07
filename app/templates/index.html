@@ -69,6 +69,51 @@
                 <div id="results-grid" class="product-grid"></div>
             </main>
         </div>
+
+        <section class="metrics-panel" id="metrics-panel">
+            <h3>Metrics <button class="toggle-btn" onclick="toggleMetrics()">show</button></h3>
+            <div class="metrics-content" id="metrics-content" style="display:none;">
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">vespa status</div>
+                        <div class="metric-value" id="m-status">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">documents indexed</div>
+                        <div class="metric-value" id="m-docs">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">query latency (avg)</div>
+                        <div class="metric-value" id="m-latency">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">query latency (max)</div>
+                        <div class="metric-value" id="m-latency-max">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">queries/sec</div>
+                        <div class="metric-value" id="m-qps">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">memory (RSS)</div>
+                        <div class="metric-value" id="m-memory">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">cpu</div>
+                        <div class="metric-value" id="m-cpu">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">connections</div>
+                        <div class="metric-value" id="m-connections">-</div>
+                    </div>
+                </div>
+                <p class="metrics-note">
+                    auto-refreshes every 5s &middot;
+                    <a href="/metrics" target="_blank">prometheus endpoint</a> &middot;
+                    <a href="/api/vespa-metrics" target="_blank">raw json</a>
+                </p>
+            </div>
+        </section>
     </div>
 
     <script>
@@ -208,6 +253,51 @@
                 });
             } catch (err) {
                 document.getElementById('stats-line').textContent = 'could not connect to backend';
+            }
+        }
+
+        // --- metrics panel ---
+        let metricsInterval = null;
+
+        function toggleMetrics() {
+            const content = document.getElementById('metrics-content');
+            const btn = document.querySelector('.toggle-btn');
+            if (content.style.display === 'none') {
+                content.style.display = 'block';
+                btn.textContent = 'hide';
+                refreshMetrics();
+                metricsInterval = setInterval(refreshMetrics, 5000);
+            } else {
+                content.style.display = 'none';
+                btn.textContent = 'show';
+                if (metricsInterval) clearInterval(metricsInterval);
+            }
+        }
+
+        async function refreshMetrics() {
+            try {
+                const resp = await fetch('/api/vespa-metrics');
+                const data = await resp.json();
+                if (data.status === 'error') {
+                    document.getElementById('m-status').textContent = 'down';
+                    document.getElementById('m-status').className = 'metric-value status-down';
+                    return;
+                }
+                const c = data.container || {};
+                const s = data.system || {};
+
+                document.getElementById('m-status').textContent = 'up';
+                document.getElementById('m-status').className = 'metric-value status-up';
+                document.getElementById('m-docs').textContent = c.total_docs || s.total_docs || '-';
+                document.getElementById('m-latency').textContent = c.query_latency_avg_ms != null ? c.query_latency_avg_ms + ' ms' : '-';
+                document.getElementById('m-latency-max').textContent = c.query_latency_max_ms != null ? c.query_latency_max_ms + ' ms' : '-';
+                document.getElementById('m-qps').textContent = c.queries_per_sec != null ? c.queries_per_sec : '-';
+                document.getElementById('m-memory').textContent = s.memory_rss_mb != null ? s.memory_rss_mb + ' MB' : '-';
+                document.getElementById('m-cpu').textContent = s.cpu_percent != null ? s.cpu_percent + '%' : '-';
+                document.getElementById('m-connections').textContent = c.search_connections != null ? c.search_connections : '-';
+            } catch (err) {
+                document.getElementById('m-status').textContent = 'error';
+                document.getElementById('m-status').className = 'metric-value status-down';
             }
         }
 
