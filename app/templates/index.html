@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Product Search</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Product Search</h1>
+            <p class="subtitle" id="stats-line">loading...</p>
+        </header>
+
+        <div class="search-bar">
+            <input type="text" id="search-input" placeholder="search for products..." autofocus>
+            <button onclick="doSearch()">Search</button>
+        </div>
+
+        <div class="layout">
+            <aside class="filters">
+                <h3>Filters</h3>
+
+                <div class="filter-group">
+                    <label>Category</label>
+                    <select id="filter-category">
+                        <option value="">all categories</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <label>Brand</label>
+                    <select id="filter-brand">
+                        <option value="">all brands</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <label>Price Range</label>
+                    <div class="price-inputs">
+                        <input type="number" id="filter-min-price" placeholder="min" min="0" step="1">
+                        <span>-</span>
+                        <input type="number" id="filter-max-price" placeholder="max" min="0" step="1">
+                    </div>
+                </div>
+
+                <div class="filter-group">
+                    <label>
+                        <input type="checkbox" id="filter-in-stock"> In stock only
+                    </label>
+                </div>
+
+                <div class="filter-group">
+                    <label>Sort by</label>
+                    <select id="filter-sort">
+                        <option value="">relevance</option>
+                        <option value="price_asc">price: low to high</option>
+                        <option value="price_desc">price: high to low</option>
+                        <option value="top_rated">top rated</option>
+                    </select>
+                </div>
+
+                <button class="clear-btn" onclick="clearFilters()">Clear Filters</button>
+            </aside>
+
+            <main class="results">
+                <div id="results-info"></div>
+                <div id="results-grid" class="product-grid"></div>
+            </main>
+        </div>
+    </div>
+
+    <script>
+        const searchInput = document.getElementById('search-input');
+        const resultsGrid = document.getElementById('results-grid');
+        const resultsInfo = document.getElementById('results-info');
+
+        // debounce search
+        let searchTimer;
+        searchInput.addEventListener('input', () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(doSearch, 300);
+        });
+
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') doSearch();
+        });
+
+        // filters trigger search
+        ['filter-category', 'filter-brand', 'filter-sort'].forEach(id => {
+            document.getElementById(id).addEventListener('change', doSearch);
+        });
+        document.getElementById('filter-in-stock').addEventListener('change', doSearch);
+
+        async function doSearch() {
+            const q = searchInput.value.trim();
+            const params = new URLSearchParams();
+
+            if (q) params.set('q', q);
+
+            const category = document.getElementById('filter-category').value;
+            if (category) params.set('category', category);
+
+            const brand = document.getElementById('filter-brand').value;
+            if (brand) params.set('brand', brand);
+
+            const minPrice = document.getElementById('filter-min-price').value;
+            if (minPrice) params.set('min_price', minPrice);
+
+            const maxPrice = document.getElementById('filter-max-price').value;
+            if (maxPrice) params.set('max_price', maxPrice);
+
+            const inStock = document.getElementById('filter-in-stock').checked;
+            if (inStock) params.set('in_stock', 'true');
+
+            const sort = document.getElementById('filter-sort').value;
+            if (sort) params.set('sort', sort);
+
+            try {
+                const resp = await fetch(`/api/search?${params}`);
+                const data = await resp.json();
+                renderResults(data);
+            } catch (err) {
+                resultsGrid.innerHTML = `<p class="error">search failed: ${err.message}</p>`;
+            }
+        }
+
+        function renderResults(data) {
+            if (data.error) {
+                resultsGrid.innerHTML = `<p class="error">${data.error}</p>`;
+                resultsInfo.textContent = '';
+                return;
+            }
+
+            resultsInfo.textContent = `${data.total} product${data.total !== 1 ? 's' : ''} found`;
+
+            if (data.hits.length === 0) {
+                resultsGrid.innerHTML = '<p class="no-results">no products found. try a different search?</p>';
+                return;
+            }
+
+            resultsGrid.innerHTML = data.hits.map(hit => `
+                <div class="product-card">
+                    <div class="product-header">
+                        <span class="product-category">${esc(hit.category || '')}</span>
+                        ${hit.in_stock === false ? '<span class="out-of-stock">out of stock</span>' : ''}
+                    </div>
+                    <h3 class="product-title">${esc(hit.title || '')}</h3>
+                    <p class="product-desc">${esc(hit.description || '')}</p>
+                    <div class="product-meta">
+                        <span class="product-price">$${(hit.price || 0).toFixed(2)}</span>
+                        <span class="product-rating">${'★'.repeat(Math.round(hit.rating || 0))}${'☆'.repeat(5 - Math.round(hit.rating || 0))} ${(hit.rating || 0).toFixed(1)}</span>
+                    </div>
+                    <div class="product-brand">${esc(hit.brand || '')}</div>
+                </div>
+            `).join('');
+        }
+
+        function esc(str) {
+            const d = document.createElement('div');
+            d.textContent = str;
+            return d.innerHTML;
+        }
+
+        function clearFilters() {
+            searchInput.value = '';
+            document.getElementById('filter-category').value = '';
+            document.getElementById('filter-brand').value = '';
+            document.getElementById('filter-min-price').value = '';
+            document.getElementById('filter-max-price').value = '';
+            document.getElementById('filter-in-stock').checked = false;
+            document.getElementById('filter-sort').value = '';
+            doSearch();
+        }
+
+        // load stats and populate filter dropdowns
+        async function loadStats() {
+            try {
+                const resp = await fetch('/api/stats');
+                const data = await resp.json();
+
+                if (data.error) {
+                    document.getElementById('stats-line').textContent = 'vespa might not be ready yet';
+                    return;
+                }
+
+                document.getElementById('stats-line').textContent =
+                    `${data.total_products} products across ${data.categories.length} categories`;
+
+                const catSelect = document.getElementById('filter-category');
+                data.categories.forEach(c => {
+                    const opt = document.createElement('option');
+                    opt.value = c.label;
+                    opt.textContent = `${c.label} (${c.count})`;
+                    catSelect.appendChild(opt);
+                });
+
+                const brandSelect = document.getElementById('filter-brand');
+                data.brands.forEach(b => {
+                    const opt = document.createElement('option');
+                    opt.value = b.label;
+                    opt.textContent = `${b.label} (${b.count})`;
+                    brandSelect.appendChild(opt);
+                });
+            } catch (err) {
+                document.getElementById('stats-line').textContent = 'could not connect to backend';
+            }
+        }
+
+        // initial load
+        loadStats();
+        doSearch();
+    </script>
+</body>
+</html>
