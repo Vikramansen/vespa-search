@@ -1,24 +1,30 @@
+from __future__ import annotations
+
 import json
-import httpx
+import os
 import subprocess
 import sys
 import tempfile
 import time
-import os
 from pathlib import Path
 
-VESPA_SEARCH_URL = "http://localhost:8080"
-VESPA_CONFIG_URL = "http://localhost:19071"
+import httpx
+
+from app.config import settings
+
 DATA_FILE = Path(__file__).parent.parent / "data" / "products.json"
 APP_PACKAGE = Path(__file__).parent.parent / "vespa-app"
 
 
-def wait_for_config_server():
+def wait_for_config_server() -> bool:
     """Wait for the config server (19071) to be ready."""
     print("waiting for vespa config server...")
-    for i in range(60):
+    for _i in range(60):
         try:
-            r = httpx.get(f"{VESPA_CONFIG_URL}/state/v1/health", timeout=5)
+            r = httpx.get(
+                f"{settings.vespa_config_url}/state/v1/health",
+                timeout=settings.vespa_state_timeout_s,
+            )
             if r.status_code == 200:
                 print("config server is up!")
                 return True
@@ -29,7 +35,7 @@ def wait_for_config_server():
     return False
 
 
-def deploy_app():
+def deploy_app() -> bool:
     """Deploy the vespa application package via config server."""
     print("deploying vespa app package...")
 
@@ -45,7 +51,7 @@ def deploy_app():
 
         with open(tmp_path, "rb") as f:
             r = httpx.post(
-                f"{VESPA_CONFIG_URL}/application/v2/tenant/default/prepareandactivate",
+                f"{settings.vespa_config_url}/application/v2/tenant/default/prepareandactivate",
                 content=f.read(),
                 headers={"Content-Type": "application/x-gzip"},
                 timeout=60,
@@ -61,12 +67,15 @@ def deploy_app():
         os.unlink(tmp_path)
 
 
-def wait_for_search_container():
+def wait_for_search_container() -> bool:
     """Wait for the search container (8080) to come up after deploy."""
     print("waiting for search container to start (this can take a minute)...")
-    for i in range(90):
+    for _i in range(90):
         try:
-            r = httpx.get(f"{VESPA_SEARCH_URL}/state/v1/health", timeout=5)
+            r = httpx.get(
+                f"{settings.vespa_url}/state/v1/health",
+                timeout=settings.vespa_state_timeout_s,
+            )
             if r.status_code == 200:
                 data = r.json()
                 status = data.get("status", {}).get("code", "")
@@ -82,7 +91,7 @@ def wait_for_search_container():
     return False
 
 
-def feed_products():
+def feed_products() -> None:
     with open(DATA_FILE) as f:
         products = json.load(f)
 
@@ -96,9 +105,9 @@ def feed_products():
 
         try:
             r = httpx.post(
-                f"{VESPA_SEARCH_URL}/document/v1/default/product/docid/{doc_id}",
+                f"{settings.vespa_url}/document/v1/default/product/docid/{doc_id}",
                 json={"fields": fields},
-                timeout=10,
+                timeout=settings.http_timeout_s,
             )
 
             if r.status_code == 200:
@@ -113,7 +122,7 @@ def feed_products():
     print(f"done! {success} succeeded, {failed} failed")
 
 
-def main():
+def main() -> None:
     if not wait_for_config_server():
         sys.exit(1)
 
