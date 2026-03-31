@@ -1,19 +1,26 @@
-import time
+from __future__ import annotations
 
-from fastapi import FastAPI, Request, Query
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pathlib import Path
-from typing import Optional
-import httpx
-from prometheus_client import (
-    Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+
+from .config import settings
+from .schemas import (
+    GroupCount,
+    HealthResponse,
+    SearchResponse,
+    StatsResponse,
+    VespaMetricsResponse,
 )
 
 app = FastAPI(title="Vespa Product Search")
-
-VESPA_URL = "http://localhost:8080"
 
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
@@ -60,37 +67,39 @@ VESPA_CONTAINER_CPU = Gauge(
     "Vespa container CPU usage percent",
 )
 
-
-@app.get("/", response_class=HTMLResponse)
-async def search_page(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+ALLOWED_SORTS = {"price_asc", "price_desc", "top_rated"}
 
 
-@app.get("/api/search")
-async def search(
-    q: str = Query(default="", description="Search query"),
-    category: Optional[str] = Query(default=None),
-    brand: Optional[str] = Query(default=None),
-    min_price: Optional[float] = Query(default=None),
-    max_price: Optional[float] = Query(default=None),
-    in_stock: Optional[bool] = Query(default=None),
-    sort: Optional[str] = Query(default=None, description="price_asc, price_desc, top_rated"),
-    limit: int = Query(default=20, ge=1, le=100),
-):
-    start = time.monotonic()
+def _escape_yql_string(value: str) -> str:
+    """Escape user-provided strings for inclusion in a YQL quoted string.
 
-    # build YQL query
-    where_clauses = []
+    This is not a full query parameterization mechanism, but it removes the
+    obvious breaking characters for `"...${value}..."` patterns.
+    """
+
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _build_yql_query(
+    *,
+    q: str,
+    category: str | None,
+    brand: str | None,
+    min_price: float | None,
+    max_price: float | None,
+    in_stock: bool | None,
+) -> str:
+    where_clauses: list[str] = []
 
     if q:
-        where_clauses.append(f'userQuery()')
+        where_clauses.append("userQuery()")
     else:
         where_clauses.append("true")
 
     if category:
-        where_clauses.append(f'category contains "{category}"')
+        where_clauses.append(f'category contains "{_escape_yql_string(category)}"')
     if brand:
-        where_clauses.append(f'brand contains "{brand}"')
+        where_clauses.append(f'brand contains "{_escape_yql_string(brand)}"')
     if min_price is not None:
         where_clauses.append(f"price >= {min_price}")
     if max_price is not None:
@@ -99,99 +108,179 @@ async def search(
         where_clauses.append(f"in_stock = {'true' if in_stock else 'false'}")
 
     where = " and ".join(where_clauses)
-    yql = f"select * from product where {where}"
+    return f"select * from product where {where}"
 
+
+@app.get("/", response_class=HTMLResponse)
+async def search_page(request: Request) -> Any:
+    """Serve the search UI."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Health check for the UI + backend + Vespa connectivity."""
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{settings.vespa_url}/state/v1/health",
+                timeout=settings.vespa_state_timeout_s,
+            )
+        reachable = resp.status_code == 200
+        return HealthResponse(
+            status="ok" if reachable else "degraded",
+            vespa_reachable=reachable,
+        )
+    except (httpx.HTTPError, ValueError) as e:
+        return HealthResponse(status="error", vespa_reachable=False, error=str(e))
+
+
+@app.get("/api/search", response_model=SearchResponse)
+async def search(
+    q: str = Query(default="", description="Search query"),
+    category: str | None = Query(default=None),
+    brand: str | None = Query(default=None),
+    min_price: float | None = Query(default=None),
+    max_price: float | None = Query(default=None),
+    in_stock: bool | None = Query(default=None),
+    sort: str | None = Query(default=None, description="price_asc, price_desc, top_rated"),
+    limit: int = Query(
+        default=settings.search_default_limit,
+        ge=settings.search_min_limit,
+        le=settings.search_max_limit,
+    ),
+) -> SearchResponse:
+    """Search products via Vespa."""
+
+    start = time.monotonic()
+
+    ranking = "default"
+    if sort is not None:
+        if sort not in ALLOWED_SORTS:
+            return SearchResponse(
+                hits=[],
+                total=0,
+                query=q if q else None,
+                error=f"Invalid sort: {sort}. Allowed: {sorted(ALLOWED_SORTS)}",
+            )
+        ranking = sort
+
+    yql = _build_yql_query(
+        q=q,
+        category=category,
+        brand=brand,
+        min_price=min_price,
+        max_price=max_price,
+        in_stock=in_stock,
+    )
     params = {
         "yql": yql,
         "hits": limit,
         "query": q if q else None,
-        "ranking": sort if sort else "default",
+        "ranking": ranking,
     }
     # remove None values
     params = {k: v for k, v in params.items() if v is not None}
 
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{VESPA_URL}/search/", params=params, timeout=10)
+            resp = await client.get(
+                f"{settings.vespa_url}/search/",
+                params=params,
+                timeout=settings.http_timeout_s,
+            )
             data = resp.json()
             SEARCH_REQUESTS.labels(status="ok").inc()
-        except Exception as e:
+        except (httpx.HTTPError, ValueError) as e:
             SEARCH_REQUESTS.labels(status="error").inc()
-            duration = time.monotonic() - start
-            SEARCH_LATENCY.observe(duration)
-            return {"error": str(e), "hits": [], "total": 0}
+            return SearchResponse(
+                hits=[],
+                total=0,
+                query=q if q else None,
+                error=str(e),
+            )
+        finally:
+            SEARCH_LATENCY.observe(time.monotonic() - start)
 
-    duration = time.monotonic() - start
-    SEARCH_LATENCY.observe(duration)
-
-    hits = []
+    hits: list[dict[str, Any]] = []
     for hit in data.get("root", {}).get("children", []):
         fields = hit.get("fields", {})
-        hits.append({
-            "id": hit.get("id", ""),
-            "relevance": hit.get("relevance", 0),
-            **fields,
-        })
+        hits.append(
+            {
+                "id": hit.get("id", ""),
+                "relevance": hit.get("relevance", 0),
+                **fields,
+            }
+        )
 
     total = data.get("root", {}).get("fields", {}).get("totalCount", 0)
     SEARCH_RESULTS.observe(len(hits))
 
-    return {"hits": hits, "total": total, "query": q}
+    return SearchResponse(hits=hits, total=total, query=q if q else None)
 
 
-@app.get("/api/stats")
-async def stats():
+@app.get("/api/stats", response_model=StatsResponse)
+async def stats() -> StatsResponse:
     """Get some basic stats about what's in vespa."""
+
     async with httpx.AsyncClient() as client:
         try:
             # get total doc count
             resp = await client.get(
-                f"{VESPA_URL}/search/",
+                f"{settings.vespa_url}/search/",
                 params={"yql": "select * from product where true", "hits": 0},
-                timeout=10,
+                timeout=settings.http_timeout_s,
             )
             data = resp.json()
             total = data.get("root", {}).get("fields", {}).get("totalCount", 0)
 
             # get unique categories
             cat_resp = await client.get(
-                f"{VESPA_URL}/search/",
+                f"{settings.vespa_url}/search/",
                 params={
-                    "yql": "select category from product where true | all(group(category) each(output(count())))",
+                    "yql": (
+                        "select category from product where true | "
+                        "all(group(category) each(output(count())))"
+                    ),
                     "hits": 0,
                 },
-                timeout=10,
+                timeout=settings.http_timeout_s,
             )
             cat_data = cat_resp.json()
-            categories = []
-            for group in _extract_groups(cat_data):
-                categories.append(group)
+            categories = _extract_groups(cat_data)
 
             # get unique brands
             brand_resp = await client.get(
-                f"{VESPA_URL}/search/",
+                f"{settings.vespa_url}/search/",
                 params={
-                    "yql": "select brand from product where true | all(group(brand) each(output(count())))",
+                    "yql": (
+                        "select brand from product where true | "
+                        "all(group(brand) each(output(count())))"
+                    ),
                     "hits": 0,
                 },
-                timeout=10,
+                timeout=settings.http_timeout_s,
             )
             brand_data = brand_resp.json()
-            brands = []
-            for group in _extract_groups(brand_data):
-                brands.append(group)
+            brands = _extract_groups(brand_data)
 
-            return {
-                "total_products": total,
-                "categories": categories,
-                "brands": brands,
-            }
-        except Exception as e:
-            return {"error": str(e)}
+            return StatsResponse(
+                total_products=total,
+                categories=categories,
+                brands=brands,
+            )
+        except (httpx.HTTPError, ValueError) as e:
+            return StatsResponse(
+                total_products=0,
+                categories=[],
+                brands=[],
+                error=str(e),
+            )
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
-async def metrics():
+async def metrics() -> PlainTextResponse:
     """Prometheus-compatible metrics endpoint. Scrapes vespa metrics too."""
     await _collect_vespa_metrics()
     return PlainTextResponse(
@@ -200,58 +289,62 @@ async def metrics():
     )
 
 
-@app.get("/api/vespa-metrics")
-async def vespa_metrics():
+@app.get("/api/vespa-metrics", response_model=VespaMetricsResponse)
+async def vespa_metrics() -> VespaMetricsResponse:
     """Human-readable vespa metrics for the dashboard."""
     async with httpx.AsyncClient() as client:
         try:
             # container metrics
             resp = await client.get(
-                f"{VESPA_URL}/state/v1/metrics", timeout=5
+                f"{settings.vespa_url}/state/v1/metrics", timeout=settings.http_timeout_s
             )
             container_metrics = resp.json()
 
             # config server metrics (has cpu/memory)
             config_resp = await client.get(
-                "http://localhost:19071/metrics/v2/values", timeout=5
+                f"{settings.vespa_config_url}/metrics/v2/values", timeout=settings.http_timeout_s
             )
             config_data = config_resp.json()
 
-            return {
-                "status": "ok",
-                "container": _summarize_container_metrics(container_metrics),
-                "system": _summarize_system_metrics(config_data),
-            }
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return VespaMetricsResponse(
+                status="ok",
+                container=_summarize_container_metrics(container_metrics),
+                system=_summarize_system_metrics(config_data),
+            )
+        except (httpx.HTTPError, ValueError) as e:
+            return VespaMetricsResponse(status="error", container={}, system={}, error=str(e))
 
 
-async def _collect_vespa_metrics():
+async def _collect_vespa_metrics() -> None:
     """Pull key metrics from vespa and update prometheus gauges."""
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(f"{VESPA_URL}/state/v1/health", timeout=3)
+            resp = await client.get(
+                f"{settings.vespa_url}/state/v1/health",
+                timeout=settings.vespa_state_timeout_s,
+            )
             VESPA_UP.set(1 if resp.status_code == 200 else 0)
-        except Exception:
+        except (httpx.HTTPError, ValueError):
             VESPA_UP.set(0)
             return
 
         try:
             # doc count
             resp = await client.get(
-                f"{VESPA_URL}/search/",
+                f"{settings.vespa_url}/search/",
                 params={"yql": "select * from product where true", "hits": 0},
-                timeout=5,
+                timeout=settings.http_timeout_s,
             )
             data = resp.json()
             total = data.get("root", {}).get("fields", {}).get("totalCount", 0)
             VESPA_DOCS.set(total)
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError):
+            VESPA_DOCS.set(0)
 
         try:
             config_resp = await client.get(
-                "http://localhost:19071/metrics/v2/values", timeout=5
+                f"{settings.vespa_config_url}/metrics/v2/values",
+                timeout=settings.http_timeout_s,
             )
             config_data = config_resp.json()
             for node in config_data.get("nodes", []):
@@ -266,11 +359,14 @@ async def _collect_vespa_metrics():
                             VESPA_QUERIES_RATE.set(vals["queries.rate"])
                         if "query_latency.average" in vals:
                             VESPA_QUERY_LATENCY.set(vals["query_latency.average"] / 1000)
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError):
+            VESPA_CONTAINER_MEMORY_RSS.set(0)
+            VESPA_CONTAINER_CPU.set(0)
+            VESPA_QUERIES_RATE.set(0)
+            VESPA_QUERY_LATENCY.set(0)
 
 
-def _summarize_container_metrics(data):
+def _summarize_container_metrics(data: dict[str, Any]) -> dict[str, Any]:
     """Pull interesting bits from vespa container /state/v1/metrics."""
     summary = {}
     for metric in data.get("metrics", {}).get("values", []):
@@ -290,7 +386,7 @@ def _summarize_container_metrics(data):
     return summary
 
 
-def _summarize_system_metrics(data):
+def _summarize_system_metrics(data: dict[str, Any]) -> dict[str, Any]:
     """Pull system-level metrics from vespa /metrics/v2/values."""
     summary = {}
     for node in data.get("nodes", []):
@@ -310,9 +406,9 @@ def _summarize_system_metrics(data):
     return summary
 
 
-def _extract_groups(data):
+def _extract_groups(data: Any) -> list[GroupCount]:
     """Pull group labels and counts out of vespa grouping response."""
-    groups = []
+    groups: list[GroupCount] = []
     try:
         children = data["root"]["children"]
         for child in children:
@@ -322,7 +418,7 @@ def _extract_groups(data):
                         for g in group_list["children"]:
                             label = g.get("value", g.get("id", "unknown"))
                             count = g.get("fields", {}).get("count()", 0)
-                            groups.append({"label": label, "count": count})
+                            groups.append(GroupCount(label=str(label), count=int(count)))
     except (KeyError, TypeError):
         pass
     return groups
